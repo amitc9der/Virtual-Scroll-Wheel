@@ -1,134 +1,143 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
-	"strconv"
-	"strings"
+	"syscall"
 
 	"github.com/gorilla/websocket"
 )
 
+var (
+	user32            = syscall.NewLazyDLL("user32.dll")
+	procMouseEvent    = user32.NewProc("mouse_event")
+	MOUSEEVENTF_WHEEL = 0x0800
+)
+
+type RotationData struct {
+	Rotation float64 `json:"rotation"`
+}
+
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// For development, you might want to check the origin and allow it if it's your local environment
-		// Here, we're allowing all origins for simplicity, which isn't recommended for production
 		return true
 	},
 }
 
-var homeTemplate = template.Must(template.New("").Parse(`
+// Simulate mouse scrolling using the Windows API
+func simulateScroll(scrollAmount int) {
+	// Multiply by 120 to simulate one scroll tick
+	scrollDelta := uintptr(scrollAmount * 120)
+	procMouseEvent.Call(uintptr(MOUSEEVENTF_WHEEL), 0, 0, scrollDelta, 0)
+}
+
+// Serve the main HTML page
+func servePage(w http.ResponseWriter, r *http.Request) {
+	tmpl := `
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Virtual Mouse</title>
-    <script src="https://unpkg.com/htmx.org@1.9.6"></script>
-    <style>
-        #disk {
-            width: 200px;
-            height: 200px;
-            border-radius: 50%;
-            background-color: gray;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            cursor: grab;
-        }
-    </style>
-    <script>
-		function calculateRotation() {
-			// Simplified for example, replace with actual calculation logic
-			let startAngle = 0; // You'd need to manage this state somehow
-			let currentAngle = 0; // Ditto
-			// ... calculation logic here ...
-			return (currentAngle - startAngle) * (180 / Math.PI);
-		}
-    </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HTMX Scroll Control</title>
+  <script src="https://unpkg.com/htmx.org"></script>
+  <style>
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      background: #282c34;
+      margin: 0;
+      color: white;
+      font-family: Arial, sans-serif;
+    }
+    #disk {
+      width: 200px;
+      height: 200px;
+      background: radial-gradient(circle, #4b4b4b, #1f1f1f);
+      border-radius: 50%;
+      border: 4px solid #ccc;
+      position: relative;
+    }
+  </style>
 </head>
 <body>
-	<div id="disk" hx-post="/rotate" hx-trigger="mousemove from:#disk" hx-swap="none" hx-vals='{"rotation": "{{calculateRotation()}}"}'></div>
+  <div id="disk" hx-get="/rotate" hx-trigger="mousemove" hx-vals='{"eventType":"move"}' hx-swap="none"></div>
+  <script>
+    const disk = document.getElementById('disk');
+    let lastAngle = 0;
+
+    function calculateAngle(event) {
+      const rect = disk.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const deltaX = event.clientX - centerX;
+      const deltaY = event.clientY - centerY;
+      return Math.atan2(deltaY, deltaX) * (180 / Math.PI);
+    }
+
+    disk.addEventListener('mousemove', (event) => {
+      if (event.buttons === 1) {
+        const currentAngle = calculateAngle(event);
+        const deltaAngle = currentAngle - lastAngle;
+        lastAngle = currentAngle;
+
+        // Send rotation data to server
+        const socket = new WebSocket('ws://localhost:8080/ws');
+        socket.onopen = () => {
+          socket.send(JSON.stringify({ rotation: deltaAngle }));
+        };
+      }
+    });
+  </script>
 </body>
 </html>
-`))
-
-func serveHome(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	homeTemplate.Execute(w, r.Host)
+`
+	tmplFuncs := template.Must(template.New("main").Parse(tmpl))
+	tmplFuncs.Execute(w, nil)
 }
 
-func echo(w http.ResponseWriter, r *http.Request) {
-	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+// Handle WebSocket connection
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		log.Println("Upgrade error:", err)
 		return
 	}
 	defer conn.Close()
 
+	log.Println("WebSocket Client connected")
+
 	for {
-		mt, message, err := conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("Connection closed: %v", err)
-			} else {
-				log.Printf("Read error: %v", err)
-			}
-			return
+			log.Println("WebSocket Read error:", err)
+			break
 		}
-		log.Printf("Received: %s", message)
-		// Here you would handle the mouse scroll based on the rotation data
-		// For now, we're just echoing back the message
-		err = conn.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("Write error:", err)
-			return
+
+		var data RotationData
+		if err := json.Unmarshal(message, &data); err != nil {
+			log.Println("JSON Unmarshal error:", err)
+			continue
 		}
+
+		// Simulate mouse scrolling
+		scrollAmount := int(data.Rotation)
+		simulateScroll(scrollAmount)
 	}
-}
-
-func rotateHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-	if r.Method == "OPTIONS" {
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body := make([]byte, r.ContentLength)
-	r.Body.Read(body)
-	rotation := strings.TrimSpace(string(body))
-
-	// Convert rotation to float for further processing
-	if rotationFloat, err := strconv.ParseFloat(rotation, 64); err == nil {
-		log.Printf("Received rotation: %f", rotationFloat)
-		// Here, you would handle the float value for mouse scrolling or other actions
-	} else {
-		log.Printf("Error parsing rotation: %v", err)
-	}
-
-	w.WriteHeader(http.StatusOK)
 }
 
 func main() {
-	http.HandleFunc("/", serveHome)
-	http.HandleFunc("/ws", echo)
-	http.HandleFunc("/rotate", rotateHandler)
+	// Serve static content and WebSocket handler
+	http.HandleFunc("/", servePage)
+	http.HandleFunc("/ws", handleWebSocket)
 
-	fmt.Println("Server is running on :8080")
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
-	}
+	// Start server
+	port := ":6610"
+	fmt.Println("Server running on http://localhost" + port)
+	log.Fatal(http.ListenAndServe(port, nil))
 }
